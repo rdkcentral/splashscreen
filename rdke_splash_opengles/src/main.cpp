@@ -55,6 +55,18 @@ namespace
 {
 constexpr const char* kDefaultDismissFile = "/tmp/.dismissSplash";
 
+// The splash is static: redraw only when needed (first frame, display-size change).
+// Poll the dismiss file on a short timer to remain responsive without busy-spinning.
+constexpr uint64_t kDismissPollIntervalMs = 50;
+
+// Some platforms/compositors expect periodic presents; redraw/present at ~20Hz to
+// avoid flicker while keeping CPU/GPU usage low.
+constexpr uint64_t kRedrawIntervalMs = 50;
+
+// Pump the Essos event loop more frequently than we redraw to keep IPC/input
+// latency low (e.g. compositor/display messages).
+constexpr useconds_t kEventLoopSleepUs = 10'000;
+
 volatile std::sig_atomic_t gShouldQuit = 0;
 
 uint64_t nowMs()
@@ -156,19 +168,17 @@ std::optional<Image> decodeJpegToRgba(const std::string& path)
         const int y = static_cast<int>(cinfo.output_scanline - 1);
         uint8_t* dst = out.rgba.data() + (static_cast<size_t>(y) * static_cast<size_t>(width) * 4);
 
-        if (components == 3)
+        for (int x = 0; x < width; ++x)
         {
-            for (int x = 0; x < width; ++x)
-            {
-                const uint8_t r = row[static_cast<size_t>(x) * 3 + 0];
-                const uint8_t g = row[static_cast<size_t>(x) * 3 + 1];
-                const uint8_t b = row[static_cast<size_t>(x) * 3 + 2];
-                dst[static_cast<size_t>(x) * 4 + 0] = r;
-                dst[static_cast<size_t>(x) * 4 + 1] = g;
-                dst[static_cast<size_t>(x) * 4 + 2] = b;
-                dst[static_cast<size_t>(x) * 4 + 3] = 0xFF;
-            }
+            const uint8_t r = row[static_cast<size_t>(x) * 3 + 0];
+            const uint8_t g = row[static_cast<size_t>(x) * 3 + 1];
+            const uint8_t b = row[static_cast<size_t>(x) * 3 + 2];
+            dst[static_cast<size_t>(x) * 4 + 0] = r;
+            dst[static_cast<size_t>(x) * 4 + 1] = g;
+            dst[static_cast<size_t>(x) * 4 + 2] = b;
+            dst[static_cast<size_t>(x) * 4 + 3] = 0xFF;
         }
+
     }
 
     jpeg_finish_decompress(&cinfo);
@@ -243,6 +253,9 @@ std::optional<Image> decodePngToRgba(const std::string& path)
     int colorType = 0;
     png_get_IHDR(pngPtr, infoPtr, &width, &height, &bitDepth, &colorType, nullptr, nullptr, nullptr);
 
+    const bool fileHasAlpha = (colorType & PNG_COLOR_MASK_ALPHA) != 0;
+    const bool fileHasTrns = png_get_valid(pngPtr, infoPtr, PNG_INFO_tRNS) != 0;
+
     if (bitDepth == 16)
         png_set_strip_16(pngPtr);
 
@@ -252,22 +265,30 @@ std::optional<Image> decodePngToRgba(const std::string& path)
     if (colorType == PNG_COLOR_TYPE_GRAY && bitDepth < 8)
         png_set_expand_gray_1_2_4_to_8(pngPtr);
 
-    if (png_get_valid(pngPtr, infoPtr, PNG_INFO_tRNS))
+    if (fileHasTrns)
         png_set_tRNS_to_alpha(pngPtr);
 
     if (colorType == PNG_COLOR_TYPE_GRAY || colorType == PNG_COLOR_TYPE_GRAY_ALPHA)
         png_set_gray_to_rgb(pngPtr);
     
-    // Ensure RGBA.
-    if (colorType == PNG_COLOR_TYPE_RGB || colorType == PNG_COLOR_TYPE_GRAY || colorType == PNG_COLOR_TYPE_PALETTE)
+    // Ensure RGBA output. After our transforms, the output will have an alpha
+    // channel iff the file already had one OR we expanded tRNS.
+    const bool outputHasAlpha = fileHasAlpha || fileHasTrns;
+    if (!outputHasAlpha)
         png_set_filler(pngPtr, 0xFF, PNG_FILLER_AFTER);
 
     png_read_update_info(pngPtr, infoPtr);
 
+    // Re-query post-transform state for clarity/robustness.
+    const int outColorType = png_get_color_type(pngPtr, infoPtr);
+    const int outBitDepth = png_get_bit_depth(pngPtr, infoPtr);
+    const int outChannels = png_get_channels(pngPtr, infoPtr);
     const png_size_t rowBytes = png_get_rowbytes(pngPtr, infoPtr);
-    if (rowBytes != width * 4)
+
+    if (outBitDepth != 8)
     {
-        std::printf("decodePng: unexpected rowBytes=%zu width=%u\n", static_cast<size_t>(rowBytes), width);
+        std::printf("decodePng: unsupported output format after transforms: colorType=%d bitDepth=%d channels=%d\n",
+                    outColorType, outBitDepth, outChannels);
         png_destroy_read_struct(&pngPtr, &infoPtr, nullptr);
         std::fclose(fp);
         return std::nullopt;
@@ -278,13 +299,68 @@ std::optional<Image> decodePngToRgba(const std::string& path)
     out.height = static_cast<int>(height);
     out.rgba.resize(static_cast<size_t>(out.width) * static_cast<size_t>(out.height) * 4);
 
-    std::vector<png_bytep> rows(static_cast<size_t>(out.height));
-    for (int y = 0; y < out.height; ++y)
+    if (outChannels == 4)
     {
-        rows[static_cast<size_t>(y)] = out.rgba.data() + (static_cast<size_t>(y) * static_cast<size_t>(out.width) * 4);
+        if (rowBytes != width * 4)
+        {
+            std::printf("decodePng: unexpected rowBytes=%zu width=%u\n", static_cast<size_t>(rowBytes), width);
+            png_destroy_read_struct(&pngPtr, &infoPtr, nullptr);
+            std::fclose(fp);
+            return std::nullopt;
+        }
+
+        std::vector<png_bytep> rows(static_cast<size_t>(out.height));
+        for (int y = 0; y < out.height; ++y)
+        {
+            rows[static_cast<size_t>(y)] = out.rgba.data() + (static_cast<size_t>(y) * static_cast<size_t>(out.width) * 4);
+        }
+
+        png_read_image(pngPtr, rows.data());
+    }
+    else if (outChannels == 3)
+    {
+        // Some libpng builds may still output RGB here. Read RGB and expand to RGBA.
+        if (rowBytes != width * 3)
+        {
+            std::printf("decodePng: unexpected rowBytes=%zu width=%u\n", static_cast<size_t>(rowBytes), width);
+            png_destroy_read_struct(&pngPtr, &infoPtr, nullptr);
+            std::fclose(fp);
+            return std::nullopt;
+        }
+
+        std::vector<uint8_t> rgb;
+        rgb.resize(static_cast<size_t>(out.width) * static_cast<size_t>(out.height) * 3);
+
+        std::vector<png_bytep> rows(static_cast<size_t>(out.height));
+        for (int y = 0; y < out.height; ++y)
+        {
+            rows[static_cast<size_t>(y)] = rgb.data() + (static_cast<size_t>(y) * static_cast<size_t>(out.width) * 3);
+        }
+
+        png_read_image(pngPtr, rows.data());
+
+        for (int y = 0; y < out.height; ++y)
+        {
+            const uint8_t* src = rgb.data() + (static_cast<size_t>(y) * static_cast<size_t>(out.width) * 3);
+            uint8_t* dst = out.rgba.data() + (static_cast<size_t>(y) * static_cast<size_t>(out.width) * 4);
+            for (int x = 0; x < out.width; ++x)
+            {
+                dst[static_cast<size_t>(x) * 4 + 0] = src[static_cast<size_t>(x) * 3 + 0];
+                dst[static_cast<size_t>(x) * 4 + 1] = src[static_cast<size_t>(x) * 3 + 1];
+                dst[static_cast<size_t>(x) * 4 + 2] = src[static_cast<size_t>(x) * 3 + 2];
+                dst[static_cast<size_t>(x) * 4 + 3] = 0xFF;
+            }
+        }
+    }
+    else
+    {
+        std::printf("decodePng: unsupported output channels after transforms: colorType=%d bitDepth=%d channels=%d\n",
+                    outColorType, outBitDepth, outChannels);
+        png_destroy_read_struct(&pngPtr, &infoPtr, nullptr);
+        std::fclose(fp);
+        return std::nullopt;
     }
 
-    png_read_image(pngPtr, rows.data());
     png_read_end(pngPtr, nullptr);
 
     png_destroy_read_struct(&pngPtr, &infoPtr, nullptr);
@@ -672,7 +748,10 @@ int main(int argc, char** argv)
         const char* detail = EssContextGetLastErrorDetail(ctx);
         std::printf("Startup failed. Essos detail: %s\n", (detail ? detail : "(none)"));
         destroyProgramAndTexture(gl);
-        EssContextDestroy(ctx);
+        // Ensure the Essos lifecycle is unwound in order on partial startup
+        // failures before destroying the context.
+         EssContextStop(ctx);
+	EssContextDestroy(ctx);
         return 4;
     }
 
@@ -694,60 +773,98 @@ int main(int argc, char** argv)
     glEnableVertexAttribArray(1);
 
     bool firstFrame = true;
+    bool warnedNoDisplaySize = false;
+    int lastDrawDisplayWidth = -1;
+    int lastDrawDisplayHeight = -1;
+    uint64_t lastDrawMs = 0;
+    uint64_t lastDismissCheckMs = 0;
     while (!gShouldQuit)
     {
-        if (fileExists(opt->dismissFile.c_str()))
-            break;
-
-        // Preserve aspect ratio by fitting the image into the display with
-        // letterboxing/pillarboxing.
-        GLfloat scaleX = 1.0f;
-        GLfloat scaleY = 1.0f;
-        if (display.width > 0 && display.height > 0 && image->width > 0 && image->height > 0)
+        const uint64_t loopNowMs = nowMs();
+        if (lastDismissCheckMs == 0 || (loopNowMs - lastDismissCheckMs) >= kDismissPollIntervalMs)
         {
-            const double displayAspect = static_cast<double>(display.width) / static_cast<double>(display.height);
-            const double imageAspect = static_cast<double>(image->width) / static_cast<double>(image->height);
-            if (imageAspect > displayAspect)
+            lastDismissCheckMs = loopNowMs;
+            if (fileExists(opt->dismissFile.c_str()))
+                break;
+        }
+
+        if (display.width <= 0 || display.height <= 0)
+        {
+            if (!warnedNoDisplaySize)
             {
-                scaleY = static_cast<GLfloat>(displayAspect / imageAspect);
+                warnedNoDisplaySize = true;
+                std::printf("Display size not available yet (got %dx%d); waiting for settings update...\n",
+                            display.width, display.height);
             }
-            else
+
+            EssContextRunEventLoopOnce(ctx);
+            usleep(kEventLoopSleepUs);
+            continue;
+        }
+
+        const bool displayChanged = (display.width != lastDrawDisplayWidth) || (display.height != lastDrawDisplayHeight);
+        const bool dueToRedraw = (lastDrawMs == 0) || ((loopNowMs - lastDrawMs) >= kRedrawIntervalMs);
+        const bool shouldDraw = firstFrame || displayChanged || dueToRedraw;
+
+        if (shouldDraw)
+        {
+            // Re-assert key GL state before drawing in case the platform touches it.
+            glUseProgram(gl.program);
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, gl.texture);
+
+            // Preserve aspect ratio by fitting the image into the display with
+            // letterboxing/pillarboxing.
+            GLfloat scaleX = 1.0f;
+            GLfloat scaleY = 1.0f;
+            if (display.width > 0 && display.height > 0 && image->width > 0 && image->height > 0)
             {
-                scaleX = static_cast<GLfloat>(imageAspect / displayAspect);
+                const double displayAspect = static_cast<double>(display.width) / static_cast<double>(display.height);
+                const double imageAspect = static_cast<double>(image->width) / static_cast<double>(image->height);
+                if (imageAspect > displayAspect)
+                {
+                    scaleY = static_cast<GLfloat>(displayAspect / imageAspect);
+                }
+                else
+                {
+                    scaleX = static_cast<GLfloat>(imageAspect / displayAspect);
+                }
+            }
+
+            const GLfloat verts[4][2] = {
+                {-scaleX, -scaleY},
+                {scaleX, -scaleY},
+                {-scaleX, scaleY},
+                {scaleX, scaleY},
+            };
+
+            glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, verts);
+
+            glViewport(0, 0, display.width, display.height);
+            glClear(GL_COLOR_BUFFER_BIT);
+            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+
+            // Present only after drawing a frame.
+            EssContextUpdateDisplay(ctx);
+            glFlush();
+
+            lastDrawMs = loopNowMs;
+            lastDrawDisplayWidth = display.width;
+            lastDrawDisplayHeight = display.height;
+
+            if (firstFrame)
+            {
+                firstFrame = false;
+                std::printf("RDKE_Splash first_frame_ms=%llu decode_ms=%llu gl_setup_ms=%llu img=%dx%d\n",
+                         static_cast<unsigned long long>(nowMs() - startMs),
+                         static_cast<unsigned long long>(decodeMs),
+                         static_cast<unsigned long long>(glSetupMs),
+                         image->width, image->height);
             }
         }
 
-        const GLfloat verts[4][2] = {
-            {-scaleX, -scaleY},
-            {scaleX, -scaleY},
-            {-scaleX, scaleY},
-            {scaleX, scaleY},
-        };
-
-        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, verts);
-
-        glViewport(0, 0, display.width, display.height);
-        glClear(GL_COLOR_BUFFER_BIT);
-        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-
-        if (firstFrame)
-        {
-            firstFrame = false;
-            char msg[256];
-            std::snprintf(msg, sizeof(msg),
-                          "RDKE_Splash first_frame_ms=%llu decode_ms=%llu gl_setup_ms=%llu img=%dx%d",
-                          static_cast<unsigned long long>(nowMs() - startMs),
-                          static_cast<unsigned long long>(decodeMs),
-                          static_cast<unsigned long long>(glSetupMs),
-                          image->width, image->height);
-            std::printf("%s\n", msg);
-        }
-
-        EssContextUpdateDisplay(ctx);
         EssContextRunEventLoopOnce(ctx);
-
-        // Reduce CPU/GPU usage while the splash is static.
-        usleep(50 * 1000);
+        usleep(kEventLoopSleepUs);
     }
 
     destroyProgramAndTexture(gl);

@@ -65,7 +65,3 @@ Notes:
 
 - The image is fit to the display while preserving aspect ratio (letterbox/pillarbox as needed).
 
-### Exit codes
-
-- `0`: normal exit (dismiss file detected)
-- `1`: usage/config/runtime failure (e.g., GL init failure)

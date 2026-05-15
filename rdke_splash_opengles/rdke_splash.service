@@ -20,6 +20,8 @@
 [Unit]
 Description=RDK Splash Screen
 After=log-rdk-start.service
+StartLimitIntervalSec=30
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -29,6 +31,7 @@ Environment="LD_PRELOAD=libwesteros_gl.so.0.0.0"
 # If no --image is provided, the app shows an internal fallback splash.
 ExecStart=/usr/bin/rdke_splash
 Restart=on-failure
+RestartSec=2
 
 [Install]
 WantedBy=multi-user.target
