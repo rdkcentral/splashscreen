@@ -1,0 +1,38 @@
+##############################################################################
+# If not stated otherwise in this file or this component's LICENSE file the
+# following copyright and licenses apply:
+#
+# Copyright 2026 RDK Management
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+##############################################################################
+
+[Unit]
+Description=RDK Splash Screen
+After=log-rdk-start.service
+StartLimitIntervalSec=30
+StartLimitBurst=5
+
+[Service]
+Type=simple
+Environment="LD_PRELOAD=libwesteros_gl.so.0.0.0"
+
+# The splash image is expected to be part of the firmware image.
+# If no --image is provided, the app shows an internal fallback splash.
+ExecStart=/usr/bin/rdke_splash
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+
